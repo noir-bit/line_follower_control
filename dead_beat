@@ -1,0 +1,171 @@
+from machine import Pin, ADC, PWM, Timer
+import gc, time, bluetooth, aioble
+import  asyncio
+# Esperar 10 segundos antes de ejecutar cualquier código
+time.sleep(1)
+
+# Configuración de potencia
+POTENCIA = 1  # 1.0 es velocidad normal
+
+# Configuración de Bluetooth con aioble
+SERVICE_UUID = bluetooth.UUID("19b10000-e8f2-537e-4f6c-d104768a1214")
+ERROR_CHAR_UUID = bluetooth.UUID("19b10001-e8f2-537e-4f6c-d104768a1214")
+
+ble_service = aioble.Service(SERVICE_UUID)
+error_characteristic = aioble.Characteristic(ble_service, ERROR_CHAR_UUID, read=True, notify=True)
+aioble.register_services(ble_service)
+
+# Configuración de pines ADC
+ADC_PINS = [13, 12, 14, 27, 34, 25, 33, 32]  # Ordenados de izquierda a derecha
+ADCS = [ADC(Pin(pin)) for pin in ADC_PINS]
+for adc in ADCS:
+    adc.atten(ADC.ATTN_11DB)  # Extender el rango de lectura hasta ~3.3V
+
+# Configuración de pines de control de motores (puente H)
+STBY = Pin(16, Pin.OUT, value=1)
+AIN1, AIN2, BIN1, BIN2 = Pin(22, Pin.OUT), Pin(18, Pin.OUT), Pin(19, Pin.OUT), Pin(21, Pin.OUT)
+AIN1.value(0), AIN2.value(0), BIN1.value(1), BIN2.value(1)  # Dirección adelante por defecto
+
+# Configuración de PWM
+PWMA = PWM(Pin(5), freq=10000, duty=0)  # Motor izquierdo
+PWMB = PWM(Pin(17), freq=10000, duty=0)  # Motor derecho
+
+# Variables para control PID
+ea, ep ,epp,eppp= 0, 0 ,0,0 # Errores pasados
+ua, up,upp,uppp = 0, 0,0,0  # Salidas pasadas
+
+# Valores para cálculo del sensor de línea
+POSICIONES = [-70, -50, -30, -10, 10, 30, 50, 70]
+
+# Variable global para la conexión BLE
+ble_connection = None
+connection_event = asyncio.Event()  # Evento para sincronizar la conexión
+
+def calculate_angulo():
+    """Calcula el ángulo basado en los sensores de línea"""
+    try:
+        voltages = [adc.read() * (3.3 / 4095) for adc in ADCS]  # Cálculo de voltajes en sensor de línea
+        numerador = sum(voltages[i] * POSICIONES[i] for i in range(len(voltages)))
+        denominador = sum(voltages)
+        return numerador / denominador if denominador != 0 else 0  # Valor central por defecto
+    except Exception as e:
+        print("Error en ADC:", e)
+        return 0
+
+def control_pwm_callback(timer):
+    """Función de control PID ejecutada periódicamente por el temporizador"""
+    global ea, ep, epp, eppp, ua, up, up, upp, uppp, PWMA, PWMB, ble_connection
+    
+    if not connection_event.is_set():  # Solo ejecutar si hay conexión establecida
+        PWMA.duty(0)
+        PWMB.duty(0)
+        return
+        
+    try:
+        base_speed = 0  # No avanza
+        max_ua = 12  # Para evitar saturación
+        max_pwm = int(1023 * POTENCIA)
+        angulo = calculate_angulo() * 0.2214   # Según caracterización de ángulo
+        
+         # Control PID
+        eppp = ep  # Error pasado
+        epp = ep  # Error pasado
+        ep = ea  # Salida pasada
+        upp = upp # Error pasado
+        upp = up  # Salida pasada
+        up = ua  # Salida pasada
+        ref_real = 0  # Referencia, 0 = centrado en la línea
+        error = ref_real - angulo
+        ea = error
+        ua = 0.99542*ea + 3.298*ep - 3.298*epp + 0.19542*up + 0.80438*upp
+        ua = max(min(ua, max_ua), -max_ua)  # Evitar saturación
+        
+        # Cálculo de PWM
+        retro = 43.1* int((ua - angulo))
+        if ea > 3:
+            AIN1.value(0), AIN2.value(1)
+            BIN1.value(0), BIN2.value(1)
+            right_pwm = int(max(0, min(0 + retro, 1023)))
+            left_pwm = int(right_pwm)
+        elif ea < -3:
+            AIN1.value(1), AIN2.value(0)
+            BIN1.value(1), BIN2.value(0)
+            left_pwm = int(max(0, min(0 - retro, 1023)))
+            right_pwm = int(left_pwm)
+
+        if -3< ea < 3:
+            AIN1.value(0), AIN2.value(0), BIN1.value(1), BIN2.value(1)  # Dirección adelante por defecto
+            PWMA.duty(300)
+            PWMB.duty(300)
+        else:
+            PWMA.duty(int(left_pwm))
+            PWMB.duty(int(right_pwm))
+        
+        # Enviar datos por Bluetooth solo si hay conexión
+        if ble_connection:
+            #salida= calculate_angulo() * 0.2214
+            
+            if -3 < error < 3:
+                error=0
+            data_string = f"{error},{ua},{ref_real},{angulo}\n"
+            error_characteristic.write(data_string, send_update=True)
+
+        gc.collect()  # Liberar memoria
+    except Exception as e:
+        print("Error en PWM:", e)
+
+async def ble_task():
+    """Maneja la conexión Bluetooth de forma asíncrona"""
+    global ble_connection
+    
+    while True:
+        print("Esperando conexión Bluetooth...")
+        try:
+            # Iniciar anuncio Bluetooth
+            connection = await aioble.advertise(
+                250_000,
+                name="ESP32-BLE",
+                services=[SERVICE_UUID],
+                timeout_ms=None
+            )
+            
+            print("Dispositivo conectado! Esperando 5 segundos para estabilizar...")
+            await asyncio.sleep(5)  # Pausa de 5 segundos después de la conexión
+            print("Conexión establecida y lista para operar!")
+            
+            ble_connection = connection
+            connection_event.set()
+            
+            # Esperar hasta que se desconecte
+            await connection.disconnected()
+            
+        except Exception as e:
+            print("Error en conexión BLE:", e)
+        finally:
+            connection_event.clear()
+            ble_connection = None
+            PWMA.duty(0)
+            PWMB.duty(0)
+            print("Dispositivo desconectado")
+
+async def main():
+    """Ejecuta el programa principal"""
+    # Iniciar el temporizador (no hará nada hasta que haya conexión)
+    timer = Timer(0)
+    timer.init(period=6, mode=Timer.PERIODIC, callback=control_pwm_callback)
+    
+    # Ejecutar tarea Bluetooth
+    await ble_task()
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print("Programa detenido manualmente")
+    PWMA.duty(0)
+    PWMB.duty(0)
+except Exception as e:
+    print("Error crítico:", e)
+    PWMA.duty(0)
+    PWMB.duty(0)
+
+
